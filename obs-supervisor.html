@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OBS Supervisor Console</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#171c24; --line:#252d38; --txt:#e6eaf0; --dim:#8b95a5;
+    --live:#e0333f; --rec:#f0a020; --ok:#2fbf71; --off:#4a5464; --accent:#4c8dff;
+    font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);padding:14px}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+  .spacer{flex:1}
+  button{font:inherit;cursor:pointer;border:1px solid var(--line);background:#1f2631;
+    color:var(--txt);border-radius:6px;padding:6px 11px}
+  button:hover{border-color:var(--accent)}
+  button:disabled{opacity:.35;cursor:default}
+  button.on{background:var(--live);border-color:var(--live)}
+  button.onrec{background:var(--rec);border-color:var(--rec);color:#201700}
+  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(310px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;
+    display:flex;flex-direction:column;gap:9px}
+  .card.alert{border-color:var(--live)}
+  .top{display:flex;align-items:center;gap:8px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--off);flex:none}
+  .dot.up{background:var(--ok)}
+  .dot.err{background:var(--live)}
+  .name{font-weight:600;font-size:14px}
+  .host{color:var(--dim);font-size:11px}
+  .badges{display:flex;gap:6px;flex-wrap:wrap;min-height:22px}
+  .badge{font-size:11px;font-weight:700;letter-spacing:.06em;padding:3px 8px;border-radius:5px;
+    background:#222a35;color:var(--dim)}
+  .badge.live{background:var(--live);color:#fff}
+  .badge.rec{background:var(--rec);color:#201700}
+  .scene{background:#11161d;border:1px solid var(--line);border-radius:7px;padding:8px 10px}
+  .scene .lbl{font-size:10px;color:var(--dim);letter-spacing:.09em;text-transform:uppercase}
+  .scene .val{font-size:16px;font-weight:600;margin-top:2px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  select{width:100%;font:inherit;background:#11161d;color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:6px}
+  .row{display:flex;gap:7px}
+  .row button{flex:1}
+  .msg{font-size:11px;color:var(--live);min-height:14px}
+  dialog{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:10px;
+    width:min(560px,92vw)}
+  textarea{width:100%;height:230px;font-family:ui-monospace,monospace;font-size:12px;
+    background:#11161d;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:9px}
+</style>
+</head>
+<body>
+<header>
+  <h1>OBS Supervisor Console Unicorn MSJ Ltd</h1>
+  <span class="host" id="clock"></span>
+  <span class="spacer"></span>
+  <button id="allRec">Record all</button>
+  <button id="allStop">Stop all</button>
+  <button id="cfgBtn">Config</button>
+</header>
+<div class="grid" id="grid"></div>
+
+<dialog id="cfg">
+  <p style="margin:0 0 8px;font-size:13px">One PC per line: <code>Name, host:port, password</code></p>
+  <textarea id="cfgText"></textarea>
+  <div class="row" style="margin-top:10px">
+    <button id="cfgSave">Save &amp; reconnect</button>
+    <button id="cfgClose">Cancel</button>
+  </div>
+</dialog>
+
+<script>
+const DEFAULT = Array.from({length:6},(_,i)=>`PC ${i+1}, 192.168.1.${10+i}:4455, changeme`).join("\n");
+const load = () => localStorage.getItem("obsCfg") || DEFAULT;
+const parse = t => t.split("\n").map(l=>l.trim()).filter(Boolean).map(l=>{
+  const p = l.split(",").map(s=>s.trim());
+  return {name:p[0]||"PC", addr:p[1]||"", pass:p.slice(2).join(",")||""};
+});
+
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const sha = async s => b64(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+const hhmmss = ms => {
+  if(!ms || ms<0) return "00:00:00";
+  const t = Math.floor(ms/1000);
+  return [t/3600, t/60%60, t%60].map(n=>String(Math.floor(n)).padStart(2,"0")).join(":");
+};
+
+class Pc {
+  constructor(cfg, el){ this.cfg=cfg; this.el=el; this.reqs=new Map(); this.id=0;
+    this.state={}; this.scenes=[]; this.connect(); }
+
+  connect(){
+    clearTimeout(this.retry);
+    try { this.ws = new WebSocket(`ws://${this.cfg.addr}`, "obswebsocket.json"); }
+    catch(e){ return this.down("bad address"); }
+    this.ws.onmessage = e => this.onMsg(JSON.parse(e.data));
+    this.ws.onclose = () => this.down("offline");
+    this.ws.onerror = () => {};
+  }
+  down(why){
+    this.up=false; this.err=why; this.render();
+    clearInterval(this.poll);
+    this.retry = setTimeout(()=>this.connect(), 4000);
+  }
+  send(o){ if(this.ws && this.ws.readyState===1) this.ws.send(JSON.stringify(o)); }
+  req(requestType, requestData){
+    const requestId = "r"+(++this.id);
+    return new Promise(res=>{ this.reqs.set(requestId,res);
+      this.send({op:6,d:{requestType,requestId,requestData}}); });
+  }
+
+  async onMsg(m){
+    if(m.op===0){
+      const a = m.d.authentication;
+      const d = {rpcVersion:1};
+      if(a) d.authentication = await sha(await sha(this.cfg.pass + a.salt) + a.challenge);
+      this.send({op:1,d});
+    }
+    else if(m.op===2){ this.up=true; this.err=""; this.refreshScenes(); this.tick();
+      clearInterval(this.poll); this.poll=setInterval(()=>this.tick(),2000); }
+    else if(m.op===5) this.onEvent(m.d.eventType, m.d.eventData);
+    else if(m.op===7){
+      const cb = this.reqs.get(m.d.requestId);
+      if(cb){ this.reqs.delete(m.d.requestId);
+        if(!m.d.requestStatus.result){ this.err = m.d.requestStatus.comment || "request failed"; this.render(); }
+        cb(m.d.responseData||{}); }
+    }
+  }
+  onEvent(t,d){
+    if(t==="CurrentProgramSceneChanged") this.state.scene = d.sceneName;
+    else if(t==="SceneListChanged") return this.refreshScenes();
+    else if(t==="StreamStateChanged") this.state.streaming = d.outputActive;
+    else if(t==="RecordStateChanged") this.state.recording = d.outputActive;
+    else return;
+    this.render();
+  }
+  async refreshScenes(){
+    const r = await this.req("GetSceneList");
+    this.scenes = (r.scenes||[]).map(s=>s.sceneName).reverse();
+    this.state.scene = r.currentProgramSceneName;
+    this.render();
+  }
+  async tick(){
+    const [s,r] = await Promise.all([this.req("GetStreamStatus"), this.req("GetRecordStatus")]);
+    this.state.streaming = s.outputActive; this.state.streamMs = s.outputDuration;
+    this.state.congestion = s.outputCongestion; this.state.skipped = s.outputSkippedFrames;
+    this.state.total = s.outputTotalFrames;
+    this.state.recording = r.outputActive; this.state.recMs = r.outputDuration;
+    this.render();
+  }
+
+  setScene(n){ this.req("SetCurrentProgramScene",{sceneName:n}); }
+  toggleStream(){ this.req(this.state.streaming?"StopStream":"StartStream"); }
+  toggleRecord(){ this.req(this.state.recording?"StopRecord":"StartRecord"); }
+
+  render(){
+    const s = this.state, on = this.up;
+    const drop = s.total ? (s.skipped/s.total*100) : 0;
+    const bad = on && (s.congestion>0.3 || drop>1);
+    this.el.className = "card" + (!on || bad ? " alert":"");
+    this.el.innerHTML = `
+      <div class="top">
+        <span class="dot ${on?'up':(this.err?'err':'')}"></span>
+        <span class="name"></span><span class="spacer"></span>
+        <span class="host">${this.cfg.addr}</span>
+      </div>
+      <div class="badges">
+        <span class="badge ${s.streaming?'live':''}">${s.streaming?'LIVE '+hhmmss(s.streamMs):'OFF AIR'}</span>
+        <span class="badge ${s.recording?'rec':''}">${s.recording?'REC '+hhmmss(s.recMs):'NOT REC'}</span>
+      </div>
+      <div class="scene"><div class="lbl">Program scene</div><div class="val sc"></div></div>
+      <select ${on?'':'disabled'}>${this.scenes.map(n=>
+        `<option${n===s.scene?' selected':''}></option>`).join("")}</select>
+      <div class="row">
+        <button class="st ${s.streaming?'on':''}" ${on?'':'disabled'}>${s.streaming?'Stop stream':'Go live'}</button>
+        <button class="rc ${s.recording?'onrec':''}" ${on?'':'disabled'}>${s.recording?'Stop rec':'Record'}</button>
+      </div>
+      <div class="msg">${on ? (bad ? `congestion ${(s.congestion||0).toFixed(2)} · dropped ${drop.toFixed(1)}%` : "") : (this.err||"connecting…")}</div>`;
+    this.el.querySelector(".name").textContent = this.cfg.name;
+    this.el.querySelector(".sc").textContent = s.scene || "—";
+    const sel = this.el.querySelector("select");
+    [...sel.options].forEach((o,i)=> o.textContent = this.scenes[i]);
+    sel.onchange = e => this.setScene(e.target.value);
+    this.el.querySelector(".st").onclick = () => this.toggleStream();
+    this.el.querySelector(".rc").onclick = () => this.toggleRecord();
+  }
+  close(){ clearInterval(this.poll); clearTimeout(this.retry); if(this.ws) { this.ws.onclose=null; this.ws.close(); } }
+}
+
+let pcs = [];
+function build(){
+  pcs.forEach(p=>p.close());
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  pcs = parse(load()).map(cfg=>{
+    const el = document.createElement("div");
+    el.className = "card"; grid.appendChild(el);
+    return new Pc(cfg, el);
+  });
+}
+document.getElementById("allRec").onclick = () => pcs.forEach(p=>{ if(p.up && !p.state.recording) p.toggleRecord(); });
+document.getElementById("allStop").onclick = () => pcs.forEach(p=>{
+  if(!p.up) return;
+  if(p.state.recording) p.toggleRecord();
+  if(p.state.streaming) p.toggleStream();
+});
+const dlg = document.getElementById("cfg");
+document.getElementById("cfgBtn").onclick = () => { document.getElementById("cfgText").value = load(); dlg.showModal(); };
+document.getElementById("cfgClose").onclick = () => dlg.close();
+document.getElementById("cfgSave").onclick = () => {
+  localStorage.setItem("obsCfg", document.getElementById("cfgText").value); dlg.close(); build();
+};
+setInterval(()=>document.getElementById("clock").textContent = new Date().toLocaleTimeString(), 1000);
+build();
+</script>
+</body>
+</html>
